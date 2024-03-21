@@ -1,12 +1,15 @@
 """Views for the Blog app"""
 
+from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector
 from django.core.mail import send_mail
 from django.core.paginator import EmptyPage, PageNotAnInteger, Paginator
+from django.db.models import Count
 from django.shortcuts import get_object_or_404, render
 from django.views.decorators.http import require_POST
 from django.views.generic import ListView
+from taggit.models import Tag
 
-from .forms import CommentForm, EmailPostForm
+from .forms import CommentForm, EmailPostForm, SearchForm
 from .models import Post
 
 
@@ -19,12 +22,17 @@ class PostListView(ListView):
     template_name = "blog/post/list.html"
 
 
-def post_list(request):
+def post_list(request, tag_slug=None):
     """Renders a list with the published posts"""
     posts = Post.published.all()
-    paginator = Paginator(posts, 2)
     page_number = request.GET.get("page", 1)
 
+    tag = None
+    if tag_slug:
+        tag = get_object_or_404(Tag, slug=tag_slug)
+        posts = posts.filter(tags__in=[tag])
+
+    paginator = Paginator(posts, 2)
     try:
         posts = paginator.page(page_number)
     except EmptyPage:
@@ -32,7 +40,7 @@ def post_list(request):
     except PageNotAnInteger:
         posts = paginator.page(1)
 
-    return render(request, "blog/post/list.html", {"posts": posts})
+    return render(request, "blog/post/list.html", {"posts": posts, "tag": tag})
 
 
 def post_detail(request, year: int, month: int, day: int, post):
@@ -47,11 +55,21 @@ def post_detail(request, year: int, month: int, day: int, post):
 
     comments = post.comments.filter(active=True)
     form = CommentForm()
+    post_tags_ids = post.tags.values_list("id", flat=True)
+    similar_posts = Post.published.filter(tags__in=post_tags_ids).exclude(id=post.id)
+    similar_posts = similar_posts.annotate(same_tags=Count("tags")).order_by(
+        "-same_tags", "-publish"
+    )[:4]
 
     return render(
         request,
         "blog/post/detail.html",
-        {"post": post, "comments": comments, "form": form},
+        {
+            "post": post,
+            "comments": comments,
+            "form": form,
+            "similar_posts": similar_posts,
+        },
     )
 
 
@@ -98,4 +116,33 @@ def post_comment(request, post_id: int):
         request,
         "blog/post/comment.html",
         {"post": post, "form": form, "comment": comment},
+    )
+
+
+def post_search(request):
+    """Search posts by a query"""
+    form = SearchForm()
+    query = None
+    results = []
+    if "query" in request.GET:
+        form = SearchForm(request.GET)
+        if form.is_valid():
+            query = form.cleaned_data["query"]
+            search_vector = SearchVector(
+                "title", config="english", weight="A"
+            ) + SearchVector("body", weight="B")
+            search_query = SearchQuery(query, config="english")
+            results = (
+                Post.published.annotate(
+                    search=search_vector,
+                    rank=SearchRank(search_vector, search_query),
+                )
+                .filter(rank__gte=0.3)
+                .order_by("-rank")
+            )
+
+    return render(
+        request,
+        "blog/post/search.html",
+        {"form": form, "query": query, "results": results},
     )
